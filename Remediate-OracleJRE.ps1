@@ -162,6 +162,8 @@ function Get-OracleJre {
 
         if (-not (Test-Path -LiteralPath $info.JavaRoot)) { continue }
         foreach ($dir in Get-ChildItem -LiteralPath $info.JavaRoot -Directory -ErrorAction SilentlyContinue) {
+            # Skip links like the family junction jre-1.8 -> jre1.8.0_xxx (handled by Remove-StaleJavaLinks)
+            if ($dir.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
             if ($dir.Name -notmatch '^jre(?:1\.(\d+)\.0_(\d+)|-?(\d+))') { continue }
             $folderMatch = $Matches.Clone()
             $ver = Get-FolderVersion $dir.FullName
@@ -386,6 +388,27 @@ function Remove-MsiRegistration($Entry, [string]$Arch) {
     return $true
 }
 
+# Java 8 installers create a hidden family junction (Java\jre-1.8 -> jre1.8.0_xxx). If it points at a
+# JRE that is no longer registered, Oracle's installer refuses to run ("FamilyJunctionValidator: jre-1.8
+# exists, and no JRE is registered to be installed there", exit -1). Removes only the link, never its target.
+function Remove-StaleJavaLinks([string]$Arch) {
+    $root = $archInfo[$Arch].JavaRoot
+    if (-not (Test-Path -LiteralPath $root)) { return }
+    $registered = @(Get-OracleJre | Where-Object { $_.Arch -eq $Arch -and $_.Source -eq 'Registry' -and $_.Path } |
+            ForEach-Object { $_.Path.TrimEnd('\') })
+    $links = Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction SilentlyContinue |
+        Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -and $_.Name -match '^jre-\d' }
+    foreach ($link in $links) {
+        $target = @((Get-Item -LiteralPath $link.FullName -Force).Target)[0]
+        if ($target) { $target = $target.TrimEnd('\') }
+        if ($target -and (Test-Path -LiteralPath $target) -and ($registered -contains $target)) { continue }
+        if ($PSCmdlet.ShouldProcess("$($link.FullName) -> $target", 'Remove stale Java family link')) {
+            Write-Log "[$Arch] Removing stale link $($link.FullName) -> $target (target not a registered JRE)"
+            [IO.Directory]::Delete($link.FullName, $false)  # deletes the junction itself, not the folder it points to
+        }
+    }
+}
+
 # Silently uninstalls a registered JRE. Returns $false on failure.
 # Falls back to removing the registration when the cached MSI is missing or damaged.
 function Uninstall-Jre($Entry, [string]$Arch) {
@@ -499,6 +522,7 @@ foreach ($arch in $archInfo.Keys) {
                 Write-Log "[$($b.Arch)] $($b.Name) has a missing/damaged cached MSI, which makes Oracle's installer crash - removing it before install."
                 if (-not (Uninstall-Jre $b $b.Arch)) { throw "Could not remove broken $($b.Name) before installing $(Format-JavaVersion $target)." }
             }
+            Remove-StaleJavaLinks $arch
 
             # An older build of the same update (e.g. 8u511-b32) occupies the same folder and product
             # code, so the new build can't install beside it - remove it first.
