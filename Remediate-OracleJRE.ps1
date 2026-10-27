@@ -388,7 +388,7 @@ function Remove-MsiRegistration($Entry, [string]$Arch) {
     return $true
 }
 
-# Java 8 installers create a hidden family junction (Java\jre-1.8 -> jre1.8.0_xxx). If it points at a
+# Java 8 installers create a family junction (Java\latest\jre-1.8 -> jre1.8.0_xxx). If it points at a
 # JRE that is no longer registered, Oracle's installer refuses to run ("FamilyJunctionValidator: jre-1.8
 # exists, and no JRE is registered to be installed there", exit -1). Removes only the link, never its target.
 function Remove-StaleJavaLinks([string]$Arch) {
@@ -396,8 +396,11 @@ function Remove-StaleJavaLinks([string]$Arch) {
     if (-not (Test-Path -LiteralPath $root)) { return }
     $registered = @(Get-OracleJre | Where-Object { $_.Arch -eq $Arch -and $_.Source -eq 'Registry' -and $_.Path } |
             ForEach-Object { $_.Path.TrimEnd('\') })
-    $links = Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction SilentlyContinue |
-        Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -and $_.Name -match '^jre-\d' }
+    $links = foreach ($dir in $root, (Join-Path $root 'latest')) {
+        if (-not (Test-Path -LiteralPath $dir)) { continue }
+        Get-ChildItem -LiteralPath $dir -Directory -Force -ErrorAction SilentlyContinue |
+            Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -and $_.Name -match '^jre-\d' }
+    }
     foreach ($link in $links) {
         $target = @((Get-Item -LiteralPath $link.FullName -Force).Target)[0]
         if ($target) { $target = $target.TrimEnd('\') }
