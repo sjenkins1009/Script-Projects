@@ -141,7 +141,17 @@ function Get-OracleJre {
 
         # -LiteralPath: key names like "Bomgar Jump Client [host-ID]" are invalid wildcard patterns
         foreach ($key in Get-ChildItem -LiteralPath $info.UninstallKey -ErrorAction SilentlyContinue) {
-            $props = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
+            # Read only the values needed: Get-ItemProperty reads every value and throws
+            # "Specified cast is not valid" when another app's key holds malformed data.
+            try {
+                $props = [pscustomobject]@{
+                    DisplayName     = $key.GetValue('DisplayName')
+                    Publisher       = $key.GetValue('Publisher')
+                    DisplayVersion  = $key.GetValue('DisplayVersion')
+                    InstallLocation = $key.GetValue('InstallLocation')
+                }
+            }
+            catch { continue }
             if ($props.Publisher -notmatch 'Oracle' -or $props.DisplayName -notmatch '^Java(?:\(TM\))? (\d+) Update (\d+)') { continue }
             $maj = [int]$Matches[1]; $upd = [int]$Matches[2]
             $ver = $null
