@@ -292,7 +292,7 @@ function Invoke-Setup([string]$FilePath, [string]$Arguments) {
         if (-not $proc.WaitForExit($InstallTimeoutMinutes * 60000)) {
             Write-Log "$(Split-Path $FilePath -Leaf) still running after $InstallTimeoutMinutes minutes - stopping it." ERROR
             Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-            return -1
+            return 1460  # ERROR_TIMEOUT - not -1, which installers return themselves
         }
         if ($proc.ExitCode -ne 1618 -or $attempt -eq 2) { return $proc.ExitCode }
         Write-Log "$(Split-Path $FilePath -Leaf) returned 1618 (another installation in progress) - waiting and retrying." WARN
@@ -312,7 +312,7 @@ function Install-Jre([string]$Installer, [string]$Arch) {
     if ($setupLog -match '\s') { $attempts = $attempts[1..2] }  # /L can't take a quoted path
     foreach ($arguments in $attempts) {
         $code = Invoke-Setup $Installer $arguments
-        if ($code -in 0, 3010, 1618, -1) { return $code }
+        if ($code -in 0, 3010, 1618, 1460) { return $code }
         Write-Log "[$Arch] Installer exited $code with arguments '$arguments'." WARN
     }
     return $code
@@ -512,7 +512,8 @@ foreach ($arch in $archInfo.Keys) {
                 Write-Log "[$arch] Installing $installer ($(Format-JavaVersion $installerVersion))"
                 $code = Install-Jre $installer $arch
                 Write-Log "[$arch] Installer exit code: $code"
-                $notice = if ($sameUpdate) { "$arch currently has no Java $Major registered for this update - investigate." } else { 'Older versions left in place.' }
+                $stillRegistered = @(Get-OracleJre) | Where-Object { $_.Arch -eq $arch -and $_.Major -eq $Major -and $_.Source -eq 'Registry' }
+                $notice = if ($stillRegistered) { 'Older versions left in place.' } else { "$arch has no Java $Major registered (older files remain on disk) - investigate." }
                 if ($code -eq 3010) { $rebootRequired = $true }
                 elseif ($code -ne 0) { throw "Installer failed with exit code $code. $notice" }
 
