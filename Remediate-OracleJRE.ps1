@@ -306,7 +306,16 @@ function Install-Jre([string]$Installer, [string]$Arch) {
     if ($Installer -match '\.msi$') {
         return Invoke-Setup msiexec.exe "/i `"$Installer`" /qn /norestart $props /l*v `"$setupLog`""
     }
-    return Invoke-Setup $Installer "/s $props /L `"$setupLog`""
+    # The Java exe wrapper exits 255 before installing anything if it rejects its command line,
+    # so fall back to fewer options: without /L, then plain /s with auto-update off.
+    $attempts = @("/s $props /L $setupLog", "/s $props", '/s AUTO_UPDATE=0')
+    if ($setupLog -match '\s') { $attempts = $attempts[1..2] }  # /L can't take a quoted path
+    foreach ($arguments in $attempts) {
+        $code = Invoke-Setup $Installer $arguments
+        if ($code -in 0, 3010, 1618, -1) { return $code }
+        Write-Log "[$Arch] Installer exited $code with arguments '$arguments'." WARN
+    }
+    return $code
 }
 
 # Silently uninstalls a registered JRE. Returns $false on failure.
