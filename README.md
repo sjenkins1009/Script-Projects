@@ -10,6 +10,7 @@ Remediates Microsoft Defender Vulnerability Management "vulnerabilities in Oracl
 - Upgrades only the architectures already present (x86 and/or x64), then silently uninstalls older Java 8 versions and deletes leftover `jre1.8.0_xxx` folders.
 - Leaves end-of-life Java majors (6, 7, 9, 10) and JDKs alone and reports them.
 - Waits for other installs in progress, retries once on exit code 1618, and stops any install step after a timeout.
+- Handles old Java 8 installs whose cached MSI in `C:\Windows\Installer` is missing or damaged (they can't be uninstalled, and they crash Oracle's installer with exit 255) by removing their Windows Installer registration first.
 - Runs silently and relaunches in 64-bit PowerShell from 32-bit RMM agents.
 
 ```powershell

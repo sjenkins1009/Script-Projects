@@ -318,17 +318,94 @@ function Install-Jre([string]$Installer, [string]$Arch) {
     return $code
 }
 
+# Windows Installer keys use a "packed" GUID: {71024AE4-039E-4CA4-87B4-2F32180481F0} -> 4EA42017E930...
+function ConvertTo-PackedGuid([string]$ProductCode) {
+    $g = $ProductCode -replace '[{}-]', ''
+    $rev = { param($s) -join ($s.ToCharArray()[($s.Length - 1)..0]) }
+    $pairs = -join (0..7 | ForEach-Object { $p = $g.Substring(16 + $_ * 2, 2); $p[1] + $p[0] })
+    (& $rev $g.Substring(0, 8)) + (& $rev $g.Substring(8, 4)) + (& $rev $g.Substring(12, 4)) + $pairs
+}
+
+$MsiHive = [Microsoft.Win32.Registry]::LocalMachine
+$MsiUserData = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18'
+
+# $true if Windows Installer's cached copy of the product's MSI exists and opens. Without it the
+# product can't be uninstalled, and Oracle's installer crashes (exit 255) when it inspects it.
+function Test-MsiCache([string]$ProductCode) {
+    $key = $MsiHive.OpenSubKey("$MsiUserData\Products\$(ConvertTo-PackedGuid $ProductCode)\InstallProperties")
+    if (-not $key) { return $false }
+    try { $package = $key.GetValue('LocalPackage') } finally { $key.Close() }
+    if (-not $package -or -not (Test-Path -LiteralPath $package)) { return $false }
+    try {
+        $installer = New-Object -ComObject WindowsInstaller.Installer
+        $db = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $installer, @($package, 0))
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($db)
+        return $true
+    }
+    catch { return $false }
+}
+
+# Deletes a product's Windows Installer and uninstall registration when its cached MSI is gone,
+# the same cleanup Microsoft's Program Install and Uninstall troubleshooter performs. Files are
+# left for the leftover-folder step.
+function Remove-MsiRegistration($Entry, [string]$Arch) {
+    $packed = ConvertTo-PackedGuid $Entry.ProductCode
+    if (-not $PSCmdlet.ShouldProcess("[$Arch] $($Entry.Name) $($Entry.ProductCode)", 'Remove broken Windows Installer registration')) { return $true }
+    Write-Log "[$Arch] Removing Windows Installer registration for $($Entry.Name) $($Entry.ProductCode) (packed $packed)"
+
+    $uninstallPath = ($archInfo[$Arch].UninstallKey -replace '^HKLM:\\', '') + "\$($Entry.ProductCode)"
+    $javaSoft = if ($Arch -eq 'x86' -and [Environment]::Is64BitOperatingSystem) { 'SOFTWARE\WOW6432Node\JavaSoft' } else { 'SOFTWARE\JavaSoft' }
+    $props = $MsiHive.OpenSubKey("$MsiUserData\Products\$packed\InstallProperties")
+    $package = if ($props) { $props.GetValue('LocalPackage'); $props.Close() }
+
+    foreach ($path in "SOFTWARE\Classes\Installer\Products\$packed", "SOFTWARE\Classes\Installer\Features\$packed",
+        "$MsiUserData\Products\$packed", $uninstallPath, "$javaSoft\Java Runtime Environment\1.$Major.0_$($Entry.Update)") {
+        if ($MsiHive.OpenSubKey($path)) { $MsiHive.DeleteSubKeyTree($path); Write-Log "[$Arch]   deleted HKLM\$path" }
+    }
+
+    # Component and upgrade-code keys list the product as a value; drop the value, and the key if it was the last one
+    $removed = 0
+    foreach ($parent in "$MsiUserData\Components", 'SOFTWARE\Classes\Installer\UpgradeCodes') {
+        $root = $MsiHive.OpenSubKey($parent)
+        if (-not $root) { continue }
+        $names = $root.GetSubKeyNames(); $root.Close()
+        foreach ($name in $names) {
+            $sub = $MsiHive.OpenSubKey("$parent\$name", $true)
+            if (-not $sub) { continue }
+            try {
+                if ($sub.GetValueNames() -contains $packed) {
+                    $sub.DeleteValue($packed); $removed++
+                    if ($sub.ValueCount -eq 0 -and $sub.SubKeyCount -eq 0) { $sub.Close(); $sub = $null; $MsiHive.DeleteSubKey("$parent\$name") }
+                }
+            }
+            finally { if ($sub) { $sub.Close() } }
+        }
+    }
+    Write-Log "[$Arch]   removed product from $removed component/upgrade-code entries"
+    if ($package -and (Test-Path -LiteralPath $package)) { Remove-Item -LiteralPath $package -Force -ErrorAction SilentlyContinue }
+    return $true
+}
+
 # Silently uninstalls a registered JRE. Returns $false on failure.
+# Falls back to removing the registration when the cached MSI is missing or damaged.
 function Uninstall-Jre($Entry, [string]$Arch) {
     if (-not $Entry.ProductCode) { Write-Log "[$Arch] $($Entry.Name) has no MSI product code - cannot uninstall silently." WARN; return $false }
     if (-not $PSCmdlet.ShouldProcess("[$Arch] $($Entry.Name) $(Format-JavaVersion $Entry.Version) $($Entry.ProductCode)", 'Uninstall')) { return $true }
     Stop-JavaProcesses
+    if (-not (Test-MsiCache $Entry.ProductCode)) {
+        Write-Log "[$Arch] Windows Installer's cached MSI for $($Entry.Name) is missing or damaged - it can't be uninstalled normally." WARN
+        return Remove-MsiRegistration $Entry $Arch
+    }
     Write-Log "[$Arch] Uninstalling $($Entry.Name) ($(Format-JavaVersion $Entry.Version)) $($Entry.ProductCode)"
     $setupLog = Join-Path (Split-Path $LogPath) "jre-uninstall-$Arch-$($Entry.Update).log"
     $exitCode = Invoke-Setup msiexec.exe "/x $($Entry.ProductCode) /qn /norestart /l*v `"$setupLog`""
     switch ($exitCode) {
         { $_ -in 0, 1605, 1614 } { Write-Log "[$Arch] Removed $($Entry.Name) (exit $_)"; return $true }
         3010 { Write-Log "[$Arch] Removed $($Entry.Name) - reboot required"; $script:rebootRequired = $true; return $true }
+        { $_ -in 1610, 1612 } {
+            Write-Log "[$Arch] Uninstall of $($Entry.Name) can't find its source (exit $_)." WARN
+            return Remove-MsiRegistration $Entry $Arch
+        }
         default { Write-Log "[$Arch] Uninstall of $($Entry.Name) failed with exit code $_" ERROR; return $false }
     }
 }
@@ -408,6 +485,20 @@ foreach ($arch in $archInfo.Keys) {
         else {
             if (-not $installer) { throw "$(Format-JavaVersion $target) is not installed and no installer was supplied for $arch." }
             Stop-JavaProcesses
+
+            # Oracle's installer inspects every installed Java's cached MSI and crashes (exit 255) if one is
+            # missing or damaged. Older Java 8 versions are being replaced anyway, so clear those first.
+            $brokenCache = @(Get-OracleJre) | Where-Object {
+                $_.Source -eq 'Registry' -and $_.ProductCode -and $_.Version -lt $target -and -not (Test-MsiCache $_.ProductCode)
+            }
+            foreach ($b in $brokenCache) {
+                if ($b.Major -ne $Major) {
+                    Write-Log "[$($b.Arch)] $($b.Name) has a missing/damaged cached MSI and may make the installer crash. Not touched (Java $($b.Major))." WARN
+                    continue
+                }
+                Write-Log "[$($b.Arch)] $($b.Name) has a missing/damaged cached MSI, which makes Oracle's installer crash - removing it before install."
+                if (-not (Uninstall-Jre $b $b.Arch)) { throw "Could not remove broken $($b.Name) before installing $(Format-JavaVersion $target)." }
+            }
 
             # An older build of the same update (e.g. 8u511-b32) occupies the same folder and product
             # code, so the new build can't install beside it - remove it first.
